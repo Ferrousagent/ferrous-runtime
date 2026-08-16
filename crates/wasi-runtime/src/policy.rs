@@ -17,39 +17,55 @@ use wasmtime_wasi::sockets::SocketAddrUse;
 use crate::capability::{CapabilityGrant, FilesystemAccess};
 use crate::command::{ApprovalReason, CommandRequest, ExecutionMode};
 
-/// Network posture for one command, derived from the grant's port allowlist.
+/// Network posture for one command, derived from the grant's port allowlists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkPolicy {
-    /// TCP sockets may be opened (only toward allowlisted loopback ports).
+    /// TCP sockets may be opened. Connect uses are further restricted to
+    /// [`Self::allowed_connect_ports`] and binds to
+    /// [`Self::allowed_bind_ports`].
     pub tcp: bool,
+    /// Loopback TCP ports the guest may *connect to*.
+    pub allowed_connect_ports: BTreeSet<u16>,
+    /// Loopback TCP ports the guest may *bind*. Empty unless explicitly
+    /// granted: binding is denied by default because a bound port can be
+    /// observed and hijacked by other local processes.
+    pub allowed_bind_ports: BTreeSet<u16>,
     /// UDP sockets may be opened. Always `false` in Phase 1: there is no UDP
     /// allowlist yet, so UDP is blanket-denied.
     pub udp: bool,
-    /// Loopback TCP ports the guest may bind or connect to.
-    pub allowed_ports: BTreeSet<u16>,
 }
 
 impl NetworkPolicy {
     /// Derive the posture from a grant: all networking is denied unless the
     /// grant explicitly allows one or more loopback TCP ports.
     pub fn from_grant(grant: &CapabilityGrant) -> Self {
-        let allowed_ports = grant.loopback_ports().clone();
-        let tcp = !allowed_ports.is_empty();
+        let allowed_connect_ports = grant.loopback_ports().clone();
+        let allowed_bind_ports = grant.loopback_bind_ports().clone();
+        let tcp = !allowed_connect_ports.is_empty() || !allowed_bind_ports.is_empty();
         Self {
             tcp,
+            allowed_connect_ports,
+            allowed_bind_ports,
             udp: false,
-            allowed_ports,
         }
     }
 
     /// Whether a socket address is permitted for the given use.
     ///
-    /// Only TCP on loopback addresses with an allowlisted port passes; binding,
-    /// UDP, and any non-loopback address are denied.
+    /// Connects pass only toward loopback addresses on an allowlisted connect
+    /// port; binds pass only on an allowlisted bind port; UDP, DNS, and any
+    /// non-loopback address are denied.
     pub fn permits(&self, addr: SocketAddr, use_: SocketAddrUse) -> bool {
         match use_ {
-            SocketAddrUse::TcpBind | SocketAddrUse::TcpConnect => {
-                self.tcp && addr.ip().is_loopback() && self.allowed_ports.contains(&addr.port())
+            SocketAddrUse::TcpConnect => {
+                self.tcp
+                    && addr.ip().is_loopback()
+                    && self.allowed_connect_ports.contains(&addr.port())
+            }
+            SocketAddrUse::TcpBind => {
+                self.tcp
+                    && addr.ip().is_loopback()
+                    && self.allowed_bind_ports.contains(&addr.port())
             }
             // Any UDP use (and any future use kind) is denied: the Phase 1
             // allowlist only covers loopback TCP ports.
@@ -113,7 +129,9 @@ pub fn classify_risk(request: &CommandRequest) -> Risk {
     {
         return Risk::RequiresApproval(ApprovalReason::FilesystemWrite);
     }
-    if request.grant.loopback_ports().iter().next().is_some() {
+    if request.grant.loopback_ports().iter().next().is_some()
+        || request.grant.loopback_bind_ports().iter().next().is_some()
+    {
         return Risk::RequiresApproval(ApprovalReason::NetworkAccess);
     }
     if request.grant.environment_names().next().is_some() {
@@ -130,7 +148,19 @@ mod tests {
     fn grant_with_ports(ports: &[u16]) -> CapabilityGrant {
         let mut grant = CapabilityGrant::empty();
         for port in ports {
-            grant = grant.allow_loopback_port(*port);
+            grant = grant
+                .allow_loopback_port(*port)
+                .expect("nonzero connect port");
+        }
+        grant
+    }
+
+    fn grant_with_bind_ports(ports: &[u16]) -> CapabilityGrant {
+        let mut grant = CapabilityGrant::empty();
+        for port in ports {
+            grant = grant
+                .allow_loopback_bind_port(*port)
+                .expect("nonzero bind port");
         }
         grant
     }
@@ -140,11 +170,12 @@ mod tests {
         let policy = NetworkPolicy::from_grant(&CapabilityGrant::empty());
         assert!(!policy.tcp);
         assert!(!policy.udp);
-        assert!(policy.allowed_ports.is_empty());
+        assert!(policy.allowed_connect_ports.is_empty());
+        assert!(policy.allowed_bind_ports.is_empty());
     }
 
     #[test]
-    fn loopback_grant_allows_only_that_port_and_use() {
+    fn connect_allowlist_does_not_permit_binding() {
         let policy = NetworkPolicy::from_grant(&grant_with_ports(&[3000]));
         assert!(policy.tcp);
 
@@ -152,7 +183,9 @@ mod tests {
             .parse::<SocketAddr>()
             .expect("valid address");
         assert!(policy.permits(loopback, SocketAddrUse::TcpConnect));
-        assert!(policy.permits(loopback, SocketAddrUse::TcpBind));
+        // The same port is NOT bindable: an approved connect must not become an
+        // impersonation surface for other local processes.
+        assert!(!policy.permits(loopback, SocketAddrUse::TcpBind));
         assert!(!policy.permits(loopback, SocketAddrUse::UdpConnect));
         assert!(!policy.permits(loopback, SocketAddrUse::UdpBind));
 
@@ -171,6 +204,21 @@ mod tests {
     }
 
     #[test]
+    fn bind_allowlist_permits_binding_but_not_connecting() {
+        let policy = NetworkPolicy::from_grant(&grant_with_bind_ports(&[4000]));
+        let bind_addr = "127.0.0.1:4000"
+            .parse::<SocketAddr>()
+            .expect("valid address");
+        assert!(policy.permits(bind_addr, SocketAddrUse::TcpBind));
+        assert!(!policy.permits(bind_addr, SocketAddrUse::TcpConnect));
+        // A bind allowlist grants nothing on other ports or other uses.
+        let other = "127.0.0.1:4001"
+            .parse::<SocketAddr>()
+            .expect("valid address");
+        assert!(!policy.permits(other, SocketAddrUse::TcpBind));
+    }
+
+    #[test]
     fn multiple_allowed_ports_are_all_permitted() {
         let policy = NetworkPolicy::from_grant(&grant_with_ports(&[3000, 5173]));
         let first = "127.0.0.1:3000"
@@ -181,6 +229,26 @@ mod tests {
             .expect("valid address");
         assert!(policy.permits(first, SocketAddrUse::TcpConnect));
         assert!(policy.permits(second, SocketAddrUse::TcpConnect));
+    }
+
+    #[test]
+    fn connect_and_bind_ports_can_coexist() {
+        let grant = CapabilityGrant::empty()
+            .allow_loopback_port(3000)
+            .expect("valid connect port")
+            .allow_loopback_bind_port(4000)
+            .expect("valid bind port");
+        let policy = NetworkPolicy::from_grant(&grant);
+        let connect = "127.0.0.1:3000"
+            .parse::<SocketAddr>()
+            .expect("valid address");
+        let bind = "127.0.0.1:4000"
+            .parse::<SocketAddr>()
+            .expect("valid address");
+        assert!(policy.permits(connect, SocketAddrUse::TcpConnect));
+        assert!(policy.permits(bind, SocketAddrUse::TcpBind));
+        assert!(!policy.permits(connect, SocketAddrUse::TcpBind));
+        assert!(!policy.permits(bind, SocketAddrUse::TcpConnect));
     }
 
     #[test]
@@ -261,7 +329,20 @@ mod tests {
     fn network_access_requires_approval() {
         let grant = CapabilityGrant::workspace(std::env::temp_dir(), FilesystemAccess::Read)
             .expect("absolute path")
-            .allow_loopback_port(3000);
+            .allow_loopback_port(3000)
+            .expect("valid connect port");
+        assert_eq!(
+            classify_risk(&classified_request(grant)),
+            Risk::RequiresApproval(ApprovalReason::NetworkAccess)
+        );
+    }
+
+    #[test]
+    fn bind_permission_also_requires_approval() {
+        let grant = CapabilityGrant::workspace(std::env::temp_dir(), FilesystemAccess::Read)
+            .expect("absolute path")
+            .allow_loopback_bind_port(4000)
+            .expect("valid bind port");
         assert_eq!(
             classify_risk(&classified_request(grant)),
             Risk::RequiresApproval(ApprovalReason::NetworkAccess)

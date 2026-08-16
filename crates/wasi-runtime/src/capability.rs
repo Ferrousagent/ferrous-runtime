@@ -21,6 +21,10 @@ pub enum CapabilityError {
     /// An environment variable name was malformed.
     #[error("invalid environment variable name: {0}")]
     InvalidEnvironmentName(String),
+    /// A loopback port of zero was allowlisted; port 0 has no legitimate
+    /// meaning and on bind means "any ephemeral port".
+    #[error("loopback port must be greater than zero: {0}")]
+    InvalidLoopbackPort(u16),
 }
 
 /// Filesystem authority for one granted root.
@@ -148,7 +152,12 @@ impl ResourceLimits {
         Ok(self)
     }
 
-    /// Maximum combined stdout/stderr bytes accepted by the session.
+    /// Maximum output budget for the session.
+    ///
+    /// Each stream's pipe traps the guest once it alone reaches this size, and
+    /// the streaming path additionally cuts the guest off once stdout and
+    /// stderr *together* exceed it, so a guest cannot write twice the declared
+    /// budget by splitting its output across streams.
     pub const fn max_output_bytes(self) -> usize {
         self.max_output_bytes
     }
@@ -174,7 +183,12 @@ impl ResourceLimits {
 pub struct CapabilityGrant {
     filesystems: Vec<FilesystemGrant>,
     environment: BTreeSet<String>,
+    /// Loopback TCP ports the guest may *connect to*.
     loopback_ports: BTreeSet<u16>,
+    /// Loopback TCP ports the guest may *bind*. Empty by default: binding is
+    /// denied unless explicitly granted, because a bound port can be observed
+    /// and hijacked by other local processes.
+    loopback_bind_ports: BTreeSet<u16>,
     native_execution: bool,
     limits: ResourceLimits,
 }
@@ -186,6 +200,7 @@ impl CapabilityGrant {
             filesystems: Vec::new(),
             environment: BTreeSet::new(),
             loopback_ports: BTreeSet::new(),
+            loopback_bind_ports: BTreeSet::new(),
             native_execution: false,
             limits: DEFAULT_LIMITS,
         }
@@ -216,10 +231,29 @@ impl CapabilityGrant {
         Ok(self)
     }
 
-    /// Add one loopback TCP port to the network allowlist.
-    pub fn allow_loopback_port(mut self, port: u16) -> Self {
+    /// Allow the guest to *connect to* one loopback TCP port.
+    ///
+    /// Port 0 is rejected: it has no legitimate allowlist meaning, and for a
+    /// bind it would expand to "any ephemeral port".
+    pub fn allow_loopback_port(mut self, port: u16) -> Result<Self, CapabilityError> {
+        if port == 0 {
+            return Err(CapabilityError::InvalidLoopbackPort(port));
+        }
         self.loopback_ports.insert(port);
-        self
+        Ok(self)
+    }
+
+    /// Allow the guest to *bind* one loopback TCP port.
+    ///
+    /// Binding is denied unless explicitly granted: a guest that binds an
+    /// allowlisted connect port could impersonate the service the operator
+    /// intended to reach. Allowing a bind is an approval-gated decision.
+    pub fn allow_loopback_bind_port(mut self, port: u16) -> Result<Self, CapabilityError> {
+        if port == 0 {
+            return Err(CapabilityError::InvalidLoopbackPort(port));
+        }
+        self.loopback_bind_ports.insert(port);
+        Ok(self)
     }
 
     /// Allow the native process backend for this command.
@@ -279,9 +313,18 @@ impl CapabilityGrant {
         &self.loopback_ports
     }
 
-    /// Whether a loopback TCP port is allowed.
+    pub(crate) fn loopback_bind_ports(&self) -> &BTreeSet<u16> {
+        &self.loopback_bind_ports
+    }
+
+    /// Whether a loopback TCP port is allowed for *connecting*.
     pub fn allows_loopback_port(&self, port: u16) -> bool {
         self.loopback_ports.contains(&port)
+    }
+
+    /// Whether a loopback TCP port is allowed for *binding*.
+    pub fn allows_loopback_bind_port(&self, port: u16) -> bool {
+        self.loopback_bind_ports.contains(&port)
     }
 
     /// Whether native process execution was explicitly granted.
@@ -367,6 +410,35 @@ mod tests {
             result,
             Err(CapabilityError::InvalidEnvironmentName(_))
         ));
+    }
+
+    #[test]
+    fn rejects_port_zero_on_connect_and_bind() {
+        assert!(matches!(
+            CapabilityGrant::empty().allow_loopback_port(0),
+            Err(CapabilityError::InvalidLoopbackPort(0))
+        ));
+        assert!(matches!(
+            CapabilityGrant::empty().allow_loopback_bind_port(0),
+            Err(CapabilityError::InvalidLoopbackPort(0))
+        ));
+    }
+
+    #[test]
+    fn bind_allowlist_is_separate_and_empty_by_default() {
+        let grant = CapabilityGrant::empty()
+            .allow_loopback_port(3000)
+            .expect("valid connect port");
+        assert!(grant.allows_loopback_port(3000));
+        // Connect allowlist does not imply bind permission.
+        assert!(!grant.allows_loopback_bind_port(3000));
+
+        let grant = grant
+            .allow_loopback_bind_port(3001)
+            .expect("valid bind port");
+        assert!(grant.allows_loopback_bind_port(3001));
+        assert!(!grant.allows_loopback_port(3001));
+        assert!(!grant.allows_loopback_bind_port(3000));
     }
 
     #[cfg(unix)]

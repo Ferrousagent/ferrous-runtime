@@ -11,6 +11,8 @@
 //! thread. Every terminal session records an [`AuditEntry`].
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -162,16 +164,35 @@ struct BrokerState {
     pending: Mutex<HashMap<u64, PendingJob>>,
     audit: Mutex<Vec<AuditEntry>>,
     approval_timeout: Duration,
+    /// Test-only: the next job id whose worker execution should panic, used to
+    /// prove that a panic is contained and the queue keeps serving.
+    #[cfg(test)]
+    panic_next: AtomicU64,
 }
 
 impl BrokerState {
     fn approval_timeout(&self) -> Duration {
         self.approval_timeout
     }
+
+    /// Append one audit entry, dropping the oldest once the cap is reached.
+    fn record(&self, entry: AuditEntry) {
+        let mut audit = self.audit.lock().unwrap_or_else(PoisonError::into_inner);
+        audit.push(entry);
+        if audit.len() > DEFAULT_MAX_AUDIT_ENTRIES {
+            let excess = audit.len() - DEFAULT_MAX_AUDIT_ENTRIES;
+            audit.drain(0..excess);
+        }
+    }
 }
 
 /// How long a parked approval waits before the sweeper auto-denies it.
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on recorded audit entries. The trail is a debugging and
+/// accountability surface, not a datastore: once full, the oldest entries are
+/// dropped so a long-lived IDE cannot grow memory without bound.
+pub const DEFAULT_MAX_AUDIT_ENTRIES: usize = 4096;
 
 /// Serializes execution behind one queue, gates risky actions on human
 /// approval, and exposes per-session cancellation.
@@ -208,8 +229,10 @@ impl ActionBroker {
         let state = Arc::new(BrokerState {
             handles: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
-            audit: Mutex::new(Vec::new()), // `audit` intentionally unbounded; the UI surfaces it
+            audit: Mutex::new(Vec::new()),
             approval_timeout,
+            #[cfg(test)]
+            panic_next: AtomicU64::new(0),
         });
         let worker_state = state.clone();
         let worker = std::thread::spawn(move || worker_loop(runtime, queue_rx, worker_state));
@@ -360,17 +383,13 @@ impl ActionBroker {
             .is_some_and(|handle| handle.is_cancelled());
         if cancelled {
             send_terminal(&job.sink, Terminal::Cancelled);
-            self.state
-                .audit
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(AuditEntry {
-                    id,
-                    actor: job.request.actor,
-                    program: job.request.program.clone(),
-                    decision: ApprovalDecision::Cancelled,
-                    outcome: AuditOutcome::Cancelled,
-                });
+            self.state.record(AuditEntry {
+                id,
+                actor: job.request.actor,
+                program: job.request.program.clone(),
+                decision: ApprovalDecision::Cancelled,
+                outcome: AuditOutcome::Cancelled,
+            });
             self.state
                 .handles
                 .lock()
@@ -403,17 +422,13 @@ impl ActionBroker {
             None => return Err(BrokerError::NotPendingApproval(id)),
         };
         send_terminal(&job.sink, Terminal::Denied);
-        self.state
-            .audit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(AuditEntry {
-                id,
-                actor: job.request.actor,
-                program: job.request.program.clone(),
-                decision: ApprovalDecision::Denied,
-                outcome: AuditOutcome::Denied,
-            });
+        self.state.record(AuditEntry {
+            id,
+            actor: job.request.actor,
+            program: job.request.program.clone(),
+            decision: ApprovalDecision::Denied,
+            outcome: AuditOutcome::Denied,
+        });
         self.state
             .handles
             .lock()
@@ -438,17 +453,13 @@ impl ActionBroker {
             .map(|pending| pending.job);
         if let Some(job) = job {
             send_terminal(&job.sink, Terminal::Cancelled);
-            self.state
-                .audit
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(AuditEntry {
-                    id,
-                    actor: job.request.actor,
-                    program: job.request.program.clone(),
-                    decision: ApprovalDecision::Cancelled,
-                    outcome: AuditOutcome::Cancelled,
-                });
+            self.state.record(AuditEntry {
+                id,
+                actor: job.request.actor,
+                program: job.request.program.clone(),
+                decision: ApprovalDecision::Cancelled,
+                outcome: AuditOutcome::Cancelled,
+            });
             self.state
                 .handles
                 .lock()
@@ -500,107 +511,145 @@ impl Drop for ActionBroker {
 }
 
 fn worker_loop(runtime: WasiRuntime, queue_rx: mpsc::Receiver<Job>, state: Arc<BrokerState>) {
-    while let Ok(mut job) = queue_rx.recv() {
-        let cancel = state
+    while let Ok(job) = queue_rx.recv() {
+        process_job_guarded(&runtime, &state, job);
+    }
+}
+
+/// Run one job inside a panic barrier so a guest-triggered host bug cannot
+/// kill the worker (and with it every queued session) silently.
+fn process_job_guarded(runtime: &WasiRuntime, state: &Arc<BrokerState>, job: Job) {
+    // Snapshot everything the terminal/audit paths need before the panic-prone
+    // body runs, so a panic can still report the session instead of orphaning it.
+    let id = job.request.id;
+    let actor = job.request.actor;
+    let program = job.request.program.clone();
+    let admission = job.admission;
+    let notify = match &job.sink {
+        JobSink::Outcome(result_tx) => JobSink::Outcome(result_tx.clone()),
+        JobSink::Events(event_tx) => JobSink::Events(event_tx.clone()),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        process_job(runtime, state, job)
+    }));
+    if let Err(_payload) = result {
+        send_terminal(
+            &notify,
+            Terminal::DeniedWith(CommandError::InvalidTransition(
+                "worker panic while executing session",
+            )),
+        );
+        state.record(AuditEntry {
+            id,
+            actor,
+            program,
+            decision: admission,
+            outcome: AuditOutcome::Failed,
+        });
+        state
             .handles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&job.request.id)
-            .cloned();
-        let Some(cancel) = cancel else {
-            send_terminal(
-                &job.sink,
-                Terminal::DeniedWith(CommandError::InvalidTransition(
-                    "session handle disappeared before start",
-                )),
-            );
+            .remove(&id);
+    }
+}
+
+fn process_job(runtime: &WasiRuntime, state: &Arc<BrokerState>, mut job: Job) {
+    #[cfg(test)]
+    if state.panic_next.swap(0, Ordering::SeqCst) == job.request.id {
+        panic!("injected broker panic for red-team test");
+    }
+    let cancel = state
+        .handles
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&job.request.id)
+        .cloned();
+    let Some(cancel) = cancel else {
+        send_terminal(
+            &job.sink,
+            Terminal::DeniedWith(CommandError::InvalidTransition(
+                "session handle disappeared before start",
+            )),
+        );
+        state
+            .handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&job.request.id);
+        return;
+    };
+    match classify_risk(&job.request) {
+        // A human already approved this specific session; run it regardless
+        // of its risk class instead of parking it again.
+        Risk::RequiresApproval(_) if job.admission == ApprovalDecision::Approved => {
+            let outcome = execute(runtime, &mut job, &cancel);
+            state.record(AuditEntry {
+                id: job.request.id,
+                actor: job.request.actor,
+                program: job.request.program.clone(),
+                decision: ApprovalDecision::Approved,
+                outcome,
+            });
             state
                 .handles
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&job.request.id);
-            continue;
-        };
-        match classify_risk(&job.request) {
-            // A human already approved this specific session; run it regardless
-            // of its risk class instead of parking it again.
-            Risk::RequiresApproval(_) if job.admission == ApprovalDecision::Approved => {
-                let outcome = execute(&runtime, &mut job, &cancel);
-                state
-                    .audit
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(AuditEntry {
-                        id: job.request.id,
-                        actor: job.request.actor,
-                        program: job.request.program.clone(),
-                        decision: ApprovalDecision::Approved,
-                        outcome,
-                    });
-                state
-                    .handles
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&job.request.id);
-            }
-            Risk::AutoApprove => {
-                let outcome = execute(&runtime, &mut job, &cancel);
-                state
-                    .audit
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(AuditEntry {
-                        id: job.request.id,
-                        actor: job.request.actor,
-                        program: job.request.program.clone(),
-                        decision: job.admission,
-                        outcome,
-                    });
-                // Release the session now that it reached a terminal state.
-                state
-                    .handles
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&job.request.id);
-            }
-            Risk::RequiresApproval(reason) => {
-                let _ = job.session.accept(SessionEvent::PendingApproval { reason });
-                // Park before notifying: the moment the caller observes the
-                // notification, approve/deny/cancel must find the session.
-                // Clone the sink sender first so we can notify after parking.
-                let notify_sink = match &job.sink {
-                    JobSink::Outcome(result_tx) => JobSink::Outcome(result_tx.clone()),
-                    JobSink::Events(event_tx) => JobSink::Events(event_tx.clone()),
-                };
-                let deadline = Instant::now() + state.approval_timeout();
-                let id = job.request.id;
+        }
+        Risk::AutoApprove => {
+            let outcome = execute(runtime, &mut job, &cancel);
+            state.record(AuditEntry {
+                id: job.request.id,
+                actor: job.request.actor,
+                program: job.request.program.clone(),
+                decision: job.admission,
+                outcome,
+            });
+            // Release the session now that it reached a terminal state.
+            state
+                .handles
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&job.request.id);
+        }
+        Risk::RequiresApproval(reason) => {
+            let _ = job.session.accept(SessionEvent::PendingApproval { reason });
+            // Park before notifying: the moment the caller observes the
+            // notification, approve/deny/cancel must find the session.
+            // Clone the sink sender first so we can notify after parking.
+            let notify_sink = match &job.sink {
+                JobSink::Outcome(result_tx) => JobSink::Outcome(result_tx.clone()),
+                JobSink::Events(event_tx) => JobSink::Events(event_tx.clone()),
+            };
+            let deadline = Instant::now() + state.approval_timeout();
+            let id = job.request.id;
+            state
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id, PendingJob { job, deadline });
+            let notified = match &notify_sink {
+                JobSink::Outcome(result_tx) => result_tx
+                    .send(BrokerOutcome::PendingApproval { reason })
+                    .is_ok(),
+                JobSink::Events(event_tx) => event_tx
+                    .send(SessionEvent::PendingApproval { reason })
+                    .is_ok(),
+            };
+            if !notified {
+                // The caller is gone (or already cancelled the parked
+                // session); do not leave a session nobody can decide on.
                 state
                     .pending
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(id, PendingJob { job, deadline });
-                let notified = match &notify_sink {
-                    JobSink::Outcome(result_tx) => result_tx
-                        .send(BrokerOutcome::PendingApproval { reason })
-                        .is_ok(),
-                    JobSink::Events(event_tx) => event_tx
-                        .send(SessionEvent::PendingApproval { reason })
-                        .is_ok(),
-                };
-                if !notified {
-                    // The caller is gone (or already cancelled the parked
-                    // session); do not leave a session nobody can decide on.
-                    state
-                        .pending
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&id);
-                    state
-                        .handles
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&id);
-                }
+                    .remove(&id);
+                state
+                    .handles
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
             }
         }
     }
@@ -627,17 +676,13 @@ fn sweeper_loop(state: Arc<BrokerState>, stopped: Arc<AtomicBool>) {
                 .map(|pending| pending.job);
             if let Some(job) = job {
                 send_terminal(&job.sink, Terminal::Denied);
-                state
-                    .audit
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(AuditEntry {
-                        id,
-                        actor: job.request.actor,
-                        program: job.request.program.clone(),
-                        decision: ApprovalDecision::TimedOut,
-                        outcome: AuditOutcome::Denied,
-                    });
+                state.record(AuditEntry {
+                    id,
+                    actor: job.request.actor,
+                    program: job.request.program.clone(),
+                    decision: ApprovalDecision::TimedOut,
+                    outcome: AuditOutcome::Denied,
+                });
                 state
                     .handles
                     .lock()
@@ -1409,5 +1454,70 @@ mod tests {
             }
         }
         panic!("a never reported cancellation");
+    }
+
+    #[test]
+    fn worker_panic_is_contained_and_the_queue_survives() {
+        let broker = ActionBroker::new().expect("broker");
+        broker.state.panic_next.store(1, Ordering::SeqCst);
+        let (component_a, request_a) =
+            request(&broker, 1, "spin-a", SPIN_WAT, grant(30, 1_000_000));
+        let receiver_a = broker.submit(component_a, request_a).expect("a submitted");
+
+        // a panics inside the worker; its receiver still gets a terminal event.
+        let outcome = receiver_a
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a terminal outcome");
+        assert!(
+            matches!(outcome, BrokerOutcome::Denied(_)),
+            "panicked session must be reported denied, got {outcome:?}"
+        );
+
+        // The worker survived the panic: a new job still completes, and the
+        // panicked session is released and recorded.
+        let (component_b, request_b) =
+            request(&broker, 2, "hello-b", HELLO_WAT, grant(30, 1_000_000));
+        let receiver_b = broker.submit(component_b, request_b).expect("b submitted");
+        let outcome_b = receiver_b
+            .recv_timeout(Duration::from_secs(10))
+            .expect("b terminal outcome");
+        assert!(matches!(outcome_b, BrokerOutcome::Completed(_)));
+
+        assert!(matches!(
+            broker.cancel(1),
+            Err(BrokerError::UnknownSession(1))
+        ));
+        let trail = broker.audit_trail();
+        assert!(
+            trail
+                .iter()
+                .any(|entry| entry.id == 1 && entry.outcome == AuditOutcome::Failed),
+            "panicked session must be audited"
+        );
+    }
+
+    #[test]
+    fn audit_trail_keeps_at_most_max_entries() {
+        let state = Arc::new(BrokerState {
+            handles: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            audit: Mutex::new(Vec::new()),
+            approval_timeout: Duration::from_secs(30),
+            panic_next: AtomicU64::new(0),
+        });
+        let total = (DEFAULT_MAX_AUDIT_ENTRIES + 5) as u64;
+        for id in 0..total {
+            state.record(AuditEntry {
+                id,
+                actor: Actor::Agent,
+                program: "tool".to_owned(),
+                decision: ApprovalDecision::AutoApproved,
+                outcome: AuditOutcome::Completed { exit_code: 0 },
+            });
+        }
+        let trail = state.audit.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(trail.len(), DEFAULT_MAX_AUDIT_ENTRIES);
+        assert_eq!(trail[0].id, 5, "oldest entries are dropped first");
+        assert_eq!(trail.last().expect("nonempty").id, total - 1);
     }
 }

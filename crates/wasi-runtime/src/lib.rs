@@ -14,6 +14,7 @@ pub mod pipe;
 pub mod policy;
 
 use std::sync::mpsc;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -76,8 +77,18 @@ impl WasiView for StoreState {
 }
 
 /// The embedded Wasmtime runtime configured for Ferrous's safe admission path.
+///
+/// Runs are serialized per runtime: wasmtime's epoch counter is engine-global,
+/// so two concurrent runs on one engine would (a) compress each other's
+/// wall-clock deadlines (each watchdog increments the shared epoch) and
+/// (b) let one run's cancellation burst blow past the other run's deadline,
+/// interrupting it. The internal run lock keeps at most one session on the
+/// engine at a time, so deadlines are exact and cancellation only ever targets
+/// its own session. Use one runtime per concurrently-executing session if
+/// parallelism is required.
 pub struct WasiRuntime {
     engine: wasmtime::Engine,
+    run_lock: Mutex<()>,
 }
 
 impl WasiRuntime {
@@ -91,7 +102,10 @@ impl WasiRuntime {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true).epoch_interruption(true);
         let engine = wasmtime::Engine::new(&config).map_err(RuntimeError::Engine)?;
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            run_lock: Mutex::new(()),
+        })
     }
 
     /// Safely validate and compile raw component bytes.
@@ -153,8 +167,12 @@ impl WasiRuntime {
         events: &mpsc::Sender<SessionEvent>,
         env_provider: &dyn Fn(&str) -> Option<String>,
     ) -> Result<WasiOutput, RuntimeError> {
-        let stdout = StreamOutputPipe::new(request.grant.limits().max_output_bytes());
-        let stderr = StreamOutputPipe::new(request.grant.limits().max_output_bytes());
+        // Serialize runs per engine: see the `WasiRuntime` docs. Without this,
+        // a concurrent run's cancellation burst could interrupt this session.
+        let _run_guard = self.run_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let budget = request.grant.limits().max_output_bytes();
+        let stdout = StreamOutputPipe::new(budget);
+        let stderr = StreamOutputPipe::new(budget);
         let (mut store, linker) =
             self.build_store(request, stdout.clone(), stderr.clone(), env_provider)?;
         let epoch_ticks = request
@@ -176,6 +194,7 @@ impl WasiRuntime {
             let mut last_tick = std::time::Instant::now();
             let mut total_stdout = Vec::new();
             let mut total_stderr = Vec::new();
+            let mut budget_closed = false;
             loop {
                 let (out_bytes, out_eof) = reader_stdout.wait_and_drain(Duration::from_millis(50));
                 if !out_bytes.is_empty() {
@@ -192,6 +211,15 @@ impl WasiRuntime {
                         stream: Stream::Stderr,
                         bytes: err_bytes,
                     });
+                }
+                // The declared output budget is *combined* across streams: cut
+                // the guest off once stdout+stderr exceed it, so a guest that
+                // splits its output cannot write 2x the budget. Each pipe alone
+                // also traps at `budget`, but the combined cap is authoritative.
+                if !budget_closed && total_stdout.len() + total_stderr.len() > budget {
+                    reader_stdout.close();
+                    reader_stderr.close();
+                    budget_closed = true;
                 }
                 if reader_cancel.is_cancelled() {
                     // Burst past the deadline so the guest traps at its next
@@ -360,6 +388,8 @@ impl WasiRuntime {
         request: &CommandRequest,
         cancel: Option<&CancelHandle>,
     ) -> Result<WasiOutput, RuntimeError> {
+        // Serialize runs per engine: see the `WasiRuntime` docs.
+        let _run_guard = self.run_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(
             request.grant.limits().max_output_bytes(),
         );
@@ -445,6 +475,55 @@ mod contract_tests {
     /// not absolute on Windows, which would make capability construction fail.
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ferrous-{name}-{}", std::process::id()))
+    }
+
+    /// WASI command that spins forever; only fuel or epoch interruption stops it.
+    const SPIN_WAT: &str = r#"
+        (component
+          (core module $m
+            (func (export "run") (result i32)
+              (block $exit
+                (loop $l (br $l)))
+              (i32.const 0)))
+          (core instance $i (instantiate $m))
+          (func $run (result (result)) (canon lift (core func $i "run")))
+          (instance (export "wasi:cli/run@0.2.12")
+            (export "run" (func $run))))
+    "#;
+
+    /// One cancellable spinning session on `runtime`.
+    fn spin_session(
+        runtime: &WasiRuntime,
+        id: u64,
+    ) -> (
+        wasmtime::component::Component,
+        CommandRequest,
+        super::cancel::CancelHandle,
+    ) {
+        let root = test_root("spin");
+        let _ = std::fs::create_dir_all(&root);
+        let grant = CapabilityGrant::workspace(&root, FilesystemAccess::Read)
+            .expect("absolute workspace")
+            .with_limits(
+                ResourceLimits::new(1_048_576, 60)
+                    .expect("valid limits")
+                    .with_fuel(4_000_000_000)
+                    .expect("valid fuel"),
+            );
+        let component = runtime
+            .compile_component(&wat::parse_str(SPIN_WAT).expect("valid WAT"))
+            .expect("component admission");
+        let request = CommandRequest::new(
+            id,
+            Actor::Agent,
+            ExecutionMode::Wasi,
+            "spin",
+            std::iter::empty::<&str>(),
+            root,
+            grant,
+        )
+        .expect("valid request");
+        (component, request, super::cancel::CancelHandle::new())
     }
     use super::command::{
         Actor, CommandRequest, ExecutionMode, SessionEvent, SessionState, Stream,
@@ -628,5 +707,59 @@ mod contract_tests {
             .accept(SessionEvent::Exited { code: Some(0) })
             .expect("session exits");
         assert!(state.accept(SessionEvent::Started).is_err());
+    }
+
+    #[test]
+    fn cancel_of_one_run_does_not_interrupt_a_concurrent_run() {
+        let runtime =
+            std::sync::Arc::new(WasiRuntime::new().expect("runtime configuration is valid"));
+        let (component_a, request_a, handle_a) = spin_session(&runtime, 1);
+        let (component_b, request_b, handle_b) = spin_session(&runtime, 2);
+
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let handle_a2 = handle_a.clone();
+        let handle_b2 = handle_b.clone();
+        let runtime_a = runtime.clone();
+        let runtime_b = runtime.clone();
+        std::thread::spawn(move || {
+            let result = runtime_a.run_wasi_cancellable(&component_a, &request_a, &handle_a2);
+            let _ = tx_a.send(result);
+        });
+        std::thread::spawn(move || {
+            let result = runtime_b.run_wasi_cancellable(&component_b, &request_b, &handle_b2);
+            let _ = tx_b.send(result);
+        });
+
+        // Let both sessions get running, then cancel only A.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        handle_a.cancel();
+
+        let result_a = rx_a
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a returns promptly");
+        assert!(
+            matches!(result_a, Err(RuntimeError::Cancelled)),
+            "a must be cancelled by its own handle, got {result_a:?}"
+        );
+
+        // Give any cross-session interference time to land: A's cancellation
+        // burst fires up to ~100ms after the cancel and B would trap within
+        // microseconds of it. If B is still running after the settle window,
+        // A's cancellation did not poison B's epoch deadline.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            rx_b.try_recv().is_err(),
+            "b must not be interrupted by a's cancellation"
+        );
+
+        handle_b.cancel();
+        let result_b = rx_b
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("b returns after its own cancel");
+        assert!(
+            matches!(result_b, Err(RuntimeError::Cancelled)),
+            "b must be cancelled by its own handle, got {result_b:?}"
+        );
     }
 }

@@ -33,6 +33,9 @@ struct StreamState {
     buffer: Vec<u8>,
     read_pos: usize,
     eof: bool,
+    /// Host-side hard close: further writes fail even if capacity remains.
+    /// Used to cut a guest off once the *combined* output budget is exhausted.
+    closed: bool,
 }
 
 impl StreamOutputPipe {
@@ -84,12 +87,27 @@ impl StreamOutputPipe {
             .eof = true;
         self.0.wake.notify_all();
     }
+
+    /// Hard-close the pipe: every subsequent write fails (the guest traps)
+    /// even while capacity remains. Used to enforce a combined output budget
+    /// across streams. Idempotent.
+    pub fn close(&self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed = true;
+        self.0.wake.notify_all();
+    }
 }
 
 #[async_trait]
 impl OutputStream for StreamOutputPipe {
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return Err(StreamError::Closed);
+        }
         if bytes.len() > self.0.capacity - state.buffer.len() {
             return Err(StreamError::Trap(wasmtime::format_err!(
                 "write beyond capacity of StreamOutputPipe"
@@ -107,6 +125,9 @@ impl OutputStream for StreamOutputPipe {
 
     fn check_write(&mut self) -> Result<usize, StreamError> {
         let state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return Err(StreamError::Closed);
+        }
         let consumed = state.buffer.len();
         if consumed < self.0.capacity {
             Ok(self.0.capacity - consumed)
@@ -145,6 +166,15 @@ impl tokio::io::AsyncWrite for StreamOutputPipe {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // `Ok(0)` from poll_write is a contract violation: consumers treat it
+        // as WriteZero. A closed or full pipe reports an error instead, which
+        // mirrors the sync path's trap semantics.
+        if state.closed || state.buffer.len() >= self.0.capacity {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "StreamOutputPipe is closed or full",
+            )));
+        }
         let amt = buf.len().min(self.0.capacity - state.buffer.len());
         state.buffer.extend_from_slice(&buf[..amt]);
         drop(state);
@@ -205,6 +235,55 @@ mod tests {
         pipe.write(Bytes::from_static(b"ab"))
             .expect("fills the pipe");
         assert!(matches!(pipe.check_write(), Err(StreamError::Closed)));
+    }
+
+    #[test]
+    fn closed_pipe_rejects_further_writes() {
+        let mut pipe = StreamOutputPipe::new(1024);
+        pipe.close();
+        assert!(matches!(
+            pipe.write(Bytes::from_static(b"x")),
+            Err(StreamError::Closed)
+        ));
+        assert!(matches!(pipe.check_write(), Err(StreamError::Closed)));
+        // A reader still drains what was written before the close.
+        pipe.set_eof();
+        let (bytes, eof) = pipe.wait_and_drain(Duration::from_millis(10));
+        assert!(bytes.is_empty());
+        assert!(eof);
+    }
+
+    #[test]
+    fn close_is_idempotent_and_keeps_buffered_bytes() {
+        let mut pipe = StreamOutputPipe::new(1024);
+        pipe.write(Bytes::from_static(b"abc"))
+            .expect("write succeeds");
+        pipe.close();
+        pipe.close();
+        assert!(matches!(
+            pipe.write(Bytes::from_static(b"d")),
+            Err(StreamError::Closed)
+        ));
+        assert_eq!(pipe.contents(), b"abc");
+    }
+
+    #[test]
+    fn async_write_errors_instead_of_reporting_zero() {
+        use std::pin::pin;
+
+        let mut pipe = StreamOutputPipe::new(2);
+        pipe.write(Bytes::from_static(b"ab"))
+            .expect("fills the pipe");
+        let mut pinned = pin!(pipe);
+        let result = tokio::io::AsyncWrite::poll_write(
+            pinned.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            b"c",
+        );
+        assert!(
+            matches!(result, Poll::Ready(Err(_))),
+            "full pipe must error, got {result:?}"
+        );
     }
 
     #[test]
