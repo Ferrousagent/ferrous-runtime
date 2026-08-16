@@ -507,8 +507,10 @@ mod contract_tests {
             .with_limits(
                 ResourceLimits::new(1_048_576, 60)
                     .expect("valid limits")
-                    .with_fuel(4_000_000_000)
-                    .expect("valid fuel"),
+                    // Unlimited fuel: a tight spin loop on a fast runner can
+                    // burn billions of instructions in well under a second, so
+                    // only cancellation (or the 60s epoch deadline) may end it.
+                    .with_unlimited_fuel(),
             );
         let component = runtime
             .compile_component(&wat::parse_str(SPIN_WAT).expect("valid WAT"))
