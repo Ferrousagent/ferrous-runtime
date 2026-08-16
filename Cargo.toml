@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wasi-runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+thiserror = "2"
+wasmtime = { version = "47.0.3", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "runtime", "std", "wit-parser"] }
+wasmtime-wasi = { version = "47.0.3", default-features = false, features = ["p2"] }
+wat = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# priority -1 lets the restriction lints below override the group.
+all = { level = "warn", priority = -1 }
+# Restriction lints: enforce the error-handling convention mechanically. Test code
+# opts out per-file with `#![allow(clippy::unwrap_used, ...)]`.
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

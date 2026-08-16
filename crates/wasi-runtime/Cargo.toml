@@ -1,0 +1,22 @@
+[package]
+name = "wasi-runtime"
+description = "Embedded WASI runtime, shell, headless browser core, and capability-based sandbox framework."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["io-util"] }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+
+[dev-dependencies]
+wat = { workspace = true }
+
+[lints]
+workspace = true

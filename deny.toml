@@ -1,0 +1,43 @@
+# cargo-deny configuration: enforce the permissive-only dependency policy.
+# See docs/adr/0001-permissive-only-dependency-policy.md.
+
+[licenses]
+# cargo-deny v2: every license not in `allow` is denied by default, so the
+# allowlist below enforces the permissive-only policy (copyleft like
+# GPL/AGPL/LGPL/SSPL/MPL is excluded implicitly).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+# Licenses that cannot be determined with confidence are an error.
+confidence-threshold = 0.8
+# Ignore our own non-published workspace crates.
+private = { ignore = true }
+# Per-crate exceptions (package name -> license). Add only via a new ADR.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[advisories]
+# cargo-deny v2 schema: vulnerability/unsound/notice advisories always emit
+# errors and are no longer configurable. `unmaintained` is a scope, not a lint
+# level; `workspace` fails only when a direct dependency is flagged.
+yanked = "deny"
+unmaintained = "workspace"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

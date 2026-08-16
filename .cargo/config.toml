@@ -1,0 +1,10 @@
+# Faster linking (Linux only, saves ~30–70% of link time):
+#
+#   Install `mold` (e.g. `sudo apt-get install mold`), then uncomment:
+#
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+# CI installs mold and sets RUSTFLAGS for the Linux check job already; this file is
+# for local dev. Do NOT force it unconditionally — it breaks non-Linux machines and
+# machines without mold installed.

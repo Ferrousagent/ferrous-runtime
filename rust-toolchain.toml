@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned for reproducibility; bump deliberately and in the same change as CI.
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
