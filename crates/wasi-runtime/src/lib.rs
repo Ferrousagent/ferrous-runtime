@@ -89,6 +89,12 @@ impl WasiView for StoreState {
 pub struct WasiRuntime {
     engine: wasmtime::Engine,
     run_lock: Mutex<()>,
+    /// Test-only observer: each run that acquires the run lock sends its
+    /// request id here just before executing. Lets tests wait until a specific
+    /// session is provably running (and owns the engine) instead of guessing
+    /// with sleeps.
+    #[cfg(test)]
+    started_hook: Mutex<Option<mpsc::Sender<u64>>>,
 }
 
 impl WasiRuntime {
@@ -105,7 +111,19 @@ impl WasiRuntime {
         Ok(Self {
             engine,
             run_lock: Mutex::new(()),
+            #[cfg(test)]
+            started_hook: Mutex::new(None),
         })
+    }
+
+    /// Test-only: install a hook that receives each run's request id as it
+    /// starts executing.
+    #[cfg(test)]
+    fn set_started_hook(&self, tx: mpsc::Sender<u64>) {
+        *self
+            .started_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
     }
 
     /// Safely validate and compile raw component bytes.
@@ -439,6 +457,15 @@ impl WasiRuntime {
                 }
             }
         });
+        #[cfg(test)]
+        if let Some(tx) = self
+            .started_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = tx.send(request.id);
+        }
         let run_result = command.wasi_cli_run().call_run(&mut store);
         let _ = stop_sender.send(());
         let _ = watchdog.join();
@@ -710,11 +737,12 @@ mod contract_tests {
             .expect("session exits");
         assert!(state.accept(SessionEvent::Started).is_err());
     }
-
     #[test]
     fn cancel_of_one_run_does_not_interrupt_a_concurrent_run() {
         let runtime =
             std::sync::Arc::new(WasiRuntime::new().expect("runtime configuration is valid"));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        runtime.set_started_hook(started_tx);
         let (component_a, request_a, handle_a) = spin_session(&runtime, 1);
         let (component_b, request_b, handle_b) = spin_session(&runtime, 2);
 
@@ -728,13 +756,22 @@ mod contract_tests {
             let result = runtime_a.run_wasi_cancellable(&component_a, &request_a, &handle_a2);
             let _ = tx_a.send(result);
         });
+        // A must be provably running (owning the run lock) before B is even
+        // spawned, so the test is deterministic about whose session is on the
+        // engine when the cancel lands.
+        assert_eq!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a starts"),
+            1
+        );
         std::thread::spawn(move || {
             let result = runtime_b.run_wasi_cancellable(&component_b, &request_b, &handle_b2);
             let _ = tx_b.send(result);
         });
 
-        // Let both sessions get running, then cancel only A.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Let A run, then cancel only A.
+        std::thread::sleep(std::time::Duration::from_millis(200));
         handle_a.cancel();
 
         let result_a = rx_a
@@ -745,10 +782,14 @@ mod contract_tests {
             "a must be cancelled by its own handle, got {result_a:?}"
         );
 
-        // Give any cross-session interference time to land: A's cancellation
-        // burst fires up to ~100ms after the cancel and B would trap within
-        // microseconds of it. If B is still running after the settle window,
-        // A's cancellation did not poison B's epoch deadline.
+        // B acquires the engine only after A finishes, then runs normally: A's
+        // cancellation burst must not have poisoned B's epoch deadline.
+        assert_eq!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("b starts after a finishes"),
+            2
+        );
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
             rx_b.try_recv().is_err(),
